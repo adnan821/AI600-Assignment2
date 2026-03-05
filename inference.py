@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -9,19 +9,20 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-# ===== Fixed settings (no CLI args) =====
+# =========================
+# Fixed config (no CLI args)
+# =========================
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_DIR = ROOT / "checkpoints"
 TEST_NPZ = ROOT / "processed_data" / "quickdraw_test.npz"
 TRAIN_NPZ = ROOT / "processed_data" / "quickdraw_train.npz"
-OUTPUT_FILE = ROOT / "submission.txt"
+OUTPUT_TXT = ROOT / "submission.txt"
 
-MODEL_KEYWORD = "patchmlp_v2_light"  
+TARGET_MODEL_KEY = "patchmlp_v2_light"
 BATCH_SIZE = 1024
-WRITE_CLASS_NAMES = False 
 
 
-def get_device() -> torch.device:
+def choose_device() -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
@@ -29,83 +30,77 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_npz_images(npz_path: Path) -> np.ndarray:
+def _first_numeric_array(npz_path: Path) -> np.ndarray:
     if not npz_path.exists():
         raise FileNotFoundError(f"Missing file: {npz_path}")
 
-    with np.load(npz_path, allow_pickle=True) as d:
-        keys = list(d.keys())
-        for k in ["images", "x", "X", "test_images", "data"]:
-            if k in d:
-                arr = np.asarray(d[k])
+    with np.load(npz_path, allow_pickle=True) as data:
+        for k in ("images", "x", "X", "test_images", "data"):
+            if k in data:
+                arr = np.asarray(data[k])
                 if arr.ndim >= 2 and np.issubdtype(arr.dtype, np.number):
-                    break
-        else:
-            # fallback: first numeric array with ndim >=2
-            arr = None
-            for k in keys:
-                cand = np.asarray(d[k])
-                if cand.ndim >= 2 and np.issubdtype(cand.dtype, np.number):
-                    arr = cand
-                    break
-            if arr is None:
-                raise ValueError(f"Could not find image array in {npz_path}. Keys: {keys}")
+                    return arr
 
-    if arr.ndim == 3:      # [N,H,W]
-        arr = arr.reshape(arr.shape[0], -1)
-    elif arr.ndim == 4:    # [N,H,W,C]
-        arr = arr.reshape(arr.shape[0], -1)
-    elif arr.ndim != 2:
-        raise ValueError(f"Unsupported test shape: {arr.shape}")
+        for k in data.files:
+            arr = np.asarray(data[k])
+            if arr.ndim >= 2 and np.issubdtype(arr.dtype, np.number):
+                return arr
 
-    return arr.astype(np.float32)
+    raise ValueError(f"No usable image array found in: {npz_path}")
 
 
-def load_class_names(npz_path: Path) -> List[str]:
-    if not npz_path.exists():
-        return []
-    with np.load(npz_path, allow_pickle=True) as d:
-        for k in ["class_names", "label_names", "classes"]:
-            if k in d:
-                return [str(x) for x in np.asarray(d[k]).reshape(-1).tolist()]
-    return []
+def load_flat_images(npz_path: Path) -> np.ndarray:
+    x = _first_numeric_array(npz_path)
+
+    if x.ndim == 2:
+        pass
+    elif x.ndim == 3:       # [N,H,W]
+        x = x.reshape(x.shape[0], -1)
+    elif x.ndim == 4:       # [N,H,W,C]
+        x = x.reshape(x.shape[0], -1)
+    else:
+        raise ValueError(f"Unsupported image shape: {x.shape}")
+
+    return x.astype(np.float32)
 
 
-def compute_mean_std(train_npz: Path) -> Tuple[float, float]:
-    x = load_npz_images(train_npz)
-    if x.max() > 1.0:
-        x = x / 255.0
-    return float(x.mean()), float(x.std() + 1e-8)
+def compute_train_stats(train_npz: Path) -> Tuple[float, float]:
+    if not train_npz.exists():
+        return 0.0, 1.0
+    try:
+        x = load_flat_images(train_npz)
+        if x.max() > 1.0:
+            x = x / 255.0
+        return float(x.mean()), float(x.std() + 1e-8)
+    except Exception:
+        return 0.0, 1.0
 
 
-def pick_best_checkpoint(checkpoint_dir: Path, keyword: str) -> Path:
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Missing directory: {checkpoint_dir}")
+def pick_best_light_checkpoint(ckpt_dir: Path) -> Path:
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
 
-    all_ckpts = sorted(checkpoint_dir.glob("*.pth"))
+    all_ckpts = sorted(ckpt_dir.glob("*.pth"))
     if not all_ckpts:
-        raise FileNotFoundError(f"No .pth files found in {checkpoint_dir}")
+        raise FileNotFoundError(f"No .pth checkpoints in: {ckpt_dir}")
 
-    kw = keyword.lower().replace("-", "_")
-    candidates = [p for p in all_ckpts if kw in p.stem.lower().replace("-", "_")]
-    candidates = [p for p in candidates if "best" in p.stem.lower()] or candidates
+    def norm(s: str) -> str:
+        return s.lower().replace("-", "_")
 
-    if not candidates:
+    light = [p for p in all_ckpts if TARGET_MODEL_KEY in norm(p.stem)]
+    if not light:
+        available = "\n".join(f" - {p.name}" for p in all_ckpts)
         raise FileNotFoundError(
-            f"No checkpoint found for keyword '{keyword}' in {checkpoint_dir}"
+            f"No checkpoint matching '{TARGET_MODEL_KEY}'. Available:\n{available}"
         )
 
-    def file_score(p: Path):
-        name = p.stem.lower()
-        # optional score parsing from filename (e.g., acc0.91)
-        m = re.search(r"(?:acc|val|score)[_\-]?([0-9]*\.?[0-9]+)", name)
-        score = float(m.group(1)) if m else -1.0
-        return (score, p.stat().st_mtime)
-
-    return sorted(candidates, key=file_score, reverse=True)[0]
+    best_named = [p for p in light if "best" in p.stem.lower()]
+    candidates = best_named if best_named else light
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
-def get_activation(name: str) -> nn.Module:
+def activation_layer(name: str) -> nn.Module:
     name = name.lower()
     if name == "relu":
         return nn.ReLU(inplace=True)
@@ -121,7 +116,7 @@ class MLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, mlp_dim),
-            get_activation(activation),
+            activation_layer(activation),
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
@@ -149,11 +144,11 @@ class MixerBlock(nn.Module):
         self.channel_mlp = MLP(dim, channel_mlp_dim, dropout=dropout, activation=activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.norm1(x).transpose(1, 2)       # [B, dim, tokens]
-        y = self.token_mlp(y).transpose(1, 2)   # [B, tokens, dim]
+        y = self.norm1(x).transpose(1, 2)        # [B, D, T]
+        y = self.token_mlp(y).transpose(1, 2)    # [B, T, D]
         x = x + y
 
-        y = self.channel_mlp(self.norm2(x))     # [B, tokens, dim]
+        y = self.channel_mlp(self.norm2(x))      # [B, T, D]
         x = x + y
         return x
 
@@ -179,8 +174,8 @@ class PatchMLP_v2(nn.Module):
         self.patch_size = patch_size
         self.in_chans = in_chans
 
-        num_patches_per_side = img_size // patch_size
-        self.num_tokens = num_patches_per_side * num_patches_per_side
+        side = img_size // patch_size
+        self.num_tokens = side * side
         patch_dim = in_chans * patch_size * patch_size
 
         self.patch_embed = nn.Linear(patch_dim, embed_dim)
@@ -215,7 +210,7 @@ class PatchMLP_v2(nn.Module):
             raise ValueError(f"Unsupported input shape: {tuple(x.shape)}")
 
         if x.size(1) != self.in_chans:
-            raise ValueError(f"Expected {self.in_chans} channels, got {x.size(1)}")
+            raise ValueError(f"Expected {self.in_chans} channel(s), got {x.size(1)}")
         return x
 
     def _patchify(self, x: torch.Tensor) -> torch.Tensor:
@@ -244,92 +239,156 @@ class PatchMLP_v2(nn.Module):
         return self.head(x)
 
 
-def extract_state_dict(obj) -> Dict[str, torch.Tensor]:
+def extract_state_dict_or_model(obj) -> Tuple[Optional[Dict[str, torch.Tensor]], Optional[nn.Module]]:
+    if isinstance(obj, nn.Module):
+        return None, obj
+
+    # TorchScript model
+    try:
+        if isinstance(obj, torch.jit.ScriptModule):
+            return None, obj
+    except Exception:
+        pass
+
     if isinstance(obj, dict):
-        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
-            obj = obj["state_dict"]
-        elif "model_state_dict" in obj and isinstance(obj["model_state_dict"], dict):
-            obj = obj["model_state_dict"]
+        for key in ("state_dict", "model_state_dict", "model", "net", "weights"):
+            maybe = obj.get(key, None)
+            if isinstance(maybe, dict):
+                sd = {k: v for k, v in maybe.items() if torch.is_tensor(v)}
+                if sd:
+                    return sd, None
 
-    if not isinstance(obj, dict):
-        raise ValueError("Checkpoint is not a state_dict dictionary.")
+        sd = {k: v for k, v in obj.items() if torch.is_tensor(v)}
+        if sd:
+            return sd, None
 
-    if not all(torch.is_tensor(v) for v in obj.values()):
-        raise ValueError("Checkpoint dict does not look like a valid state_dict.")
-
-    return obj
+    raise ValueError("Unsupported checkpoint format.")
 
 
-def remap_state_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    out = {}
+def _strip_prefixes(k: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        for p in ("module.", "model.", "network.", "backbone."):
+            if k.startswith(p):
+                k = k[len(p):]
+                changed = True
+    return k
+
+
+def normalize_state_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    remap = [
+        (".token_mixer.", ".token_mlp."),
+        (".channel_mixer.", ".channel_mlp."),
+        (".mlp_tokens.", ".token_mlp."),
+        (".mlp_channels.", ".channel_mlp."),
+        (".ln1.", ".norm1."),
+        (".ln2.", ".norm2."),
+        (".norm_1.", ".norm1."),
+        (".norm_2.", ".norm2."),
+        (".fc1.", ".net.0."),
+        (".fc2.", ".net.3."),
+        (".linear1.", ".net.0."),
+        (".linear2.", ".net.3."),
+    ]
+
+    out: Dict[str, torch.Tensor] = {}
     for k, v in state.items():
-        nk = k
-        if nk.startswith("module."):
-            nk = nk[len("module."):]
-        if nk.startswith("model."):
-            nk = nk[len("model."):]
-
-        nk = nk.replace(".token_mixer.", ".token_mlp.")
-        nk = nk.replace(".channel_mixer.", ".channel_mlp.")
-        nk = nk.replace(".ln1.", ".norm1.")
-        nk = nk.replace(".ln2.", ".norm2.")
-        nk = nk.replace(".fc1.", ".net.0.")
-        nk = nk.replace(".fc2.", ".net.3.")
+        nk = _strip_prefixes(k)
+        for a, b in remap:
+            nk = nk.replace(a, b)
         out[nk] = v
     return out
 
 
-def infer_config_from_state(state: Dict[str, torch.Tensor]) -> Dict[str, int]:
-    if "patch_embed.weight" not in state or "pos_embed" not in state or "head.weight" not in state:
-        raise ValueError("Checkpoint missing required PatchMLP_v2 keys.")
+def _key_by_suffix(state: Dict[str, torch.Tensor], suffixes) -> Optional[str]:
+    for s in suffixes:
+        if s in state:
+            return s
+    for k in state.keys():
+        for s in suffixes:
+            if k.endswith(s):
+                return k
+    return None
 
-    patch_embed_w = state["patch_embed.weight"] 
-    embed_dim = int(patch_embed_w.shape[0])
-    patch_dim = int(patch_embed_w.shape[1])
 
-    pos_embed = state["pos_embed"]               
+def infer_patchmlp_config(state: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    k_patch = _key_by_suffix(state, ["patch_embed.weight"])
+    k_pos = _key_by_suffix(state, ["pos_embed"])
+    k_head = _key_by_suffix(state, ["head.weight"])
 
-    head_w = state["head.weight"]              
+    if k_patch is None or k_pos is None or k_head is None:
+        raise ValueError("Could not find patch_embed/pos_embed/head in checkpoint.")
+
+    patch_w = state[k_patch]   # [embed_dim, patch_dim]
+    pos = state[k_pos]         # [1, num_tokens, embed_dim]
+    head_w = state[k_head]     # [num_classes, embed_dim]
+
+    if patch_w.ndim != 2 or pos.ndim != 3 or head_w.ndim != 2:
+        raise ValueError("Invalid checkpoint tensor shapes for PatchMLP_v2.")
+
+    embed_dim = int(patch_w.shape[0])
+    patch_dim = int(patch_w.shape[1])
+    num_tokens = int(pos.shape[1])
     num_classes = int(head_w.shape[0])
 
-    block_ids = set()
+    block_ids = []
     for k in state.keys():
-        m = re.match(r"blocks\.(\d+)\.", k)
+        m = re.search(r"(?:blocks|mixer_blocks|layers)\.(\d+)\.", k)
         if m:
-            block_ids.add(int(m.group(1)))
-    depth = (max(block_ids) + 1) if block_ids else 0
-    if depth <= 0:
-        raise ValueError("Could not infer model depth from checkpoint.")
+            block_ids.append(int(m.group(1)))
+    if not block_ids:
+        raise ValueError("Could not infer depth (no block keys found).")
+    depth = max(block_ids) + 1
 
-    def find_hidden(prefix: str, input_dim: int) -> int:
-        cands = []
+    def infer_hidden(in_dim: int, marks) -> int:
+        for mark in marks:
+            for k, v in state.items():
+                if mark in k and k.endswith("weight") and getattr(v, "ndim", 0) == 2:
+                    if int(v.shape[1]) == in_dim:
+                        return int(v.shape[0])
+
+        # fallback: first block with matching input dim
         for k, v in state.items():
-            if k.startswith(prefix) and k.endswith("weight") and getattr(v, "ndim", 0) == 2:
-                if int(v.shape[1]) == input_dim:
-                    cands.append((k, int(v.shape[0])))
-        if not cands:
-            raise ValueError(f"Could not infer hidden dim for {prefix}")
-        cands.sort(key=lambda x: x[0])
-        return cands[0][1]
+            if (("blocks.0" in k) or ("layers.0" in k)) and k.endswith("weight") and getattr(v, "ndim", 0) == 2:
+                if int(v.shape[1]) == in_dim:
+                    return int(v.shape[0])
 
-    token_mlp_dim = find_hidden("blocks.0.token_mlp", num_tokens)
-    channel_mlp_dim = find_hidden("blocks.0.channel_mlp", embed_dim)
+        raise ValueError(f"Could not infer hidden dim for in_dim={in_dim}")
+
+    token_mlp_dim = infer_hidden(
+        num_tokens,
+        marks=[
+            "blocks.0.token_mlp.net.0",
+            "blocks.0.token_mlp.fc1",
+            "layers.0.token_mlp.net.0",
+            "layers.0.token_mlp.fc1",
+        ],
+    )
+    channel_mlp_dim = infer_hidden(
+        embed_dim,
+        marks=[
+            "blocks.0.channel_mlp.net.0",
+            "blocks.0.channel_mlp.fc1",
+            "layers.0.channel_mlp.net.0",
+            "layers.0.channel_mlp.fc1",
+        ],
+    )
 
     p = int(round(patch_dim ** 0.5))
     if p * p == patch_dim:
         in_chans = 1
         patch_size = p
     else:
-        p3 = int(round((patch_dim / 3) ** 0.5))
-        if 3 * p3 * p3 == patch_dim:
-            in_chans = 3
-            patch_size = p3
-        else:
-            raise ValueError(f"Cannot infer patch_size/in_chans from patch_dim={patch_dim}")
+        p3 = int(round((patch_dim / 3.0) ** 0.5))
+        if 3 * p3 * p3 != patch_dim:
+            raise ValueError(f"Cannot infer patch_size from patch_dim={patch_dim}")
+        in_chans = 3
+        patch_size = p3
 
     side_tokens = int(round(num_tokens ** 0.5))
     if side_tokens * side_tokens != num_tokens:
-        raise ValueError(f"num_tokens={num_tokens} is not a square.")
+        raise ValueError("num_tokens is not a square; cannot infer img_size.")
     img_size = side_tokens * patch_size
 
     return {
@@ -346,10 +405,15 @@ def infer_config_from_state(state: Dict[str, torch.Tensor]) -> Dict[str, int]:
 
 def build_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> nn.Module:
     raw = torch.load(ckpt_path, map_location="cpu")
-    state = extract_state_dict(raw)
-    state = remap_state_keys(state)
+    state, model_obj = extract_state_dict_or_model(raw)
 
-    cfg = infer_config_from_state(state)
+    if model_obj is not None:
+        return model_obj.to(device).eval()
+
+    assert state is not None
+    state = normalize_state_keys(state)
+    cfg = infer_patchmlp_config(state)
+
     model = PatchMLP_v2(
         num_classes=cfg["num_classes"],
         img_size=cfg["img_size"],
@@ -363,55 +427,54 @@ def build_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> nn.Mod
         activation="gelu",
     )
 
-    incompatible = model.load_state_dict(state, strict=False)
-    if incompatible.missing_keys:
-        print(f"[WARN] Missing keys: {len(incompatible.missing_keys)}")
-    if incompatible.unexpected_keys:
-        print(f"[WARN] Unexpected keys: {len(incompatible.unexpected_keys)}")
+    model_sd = model.state_dict()
+    matched = sum(1 for k, v in state.items() if k in model_sd and model_sd[k].shape == v.shape)
+    if matched < max(10, int(0.5 * len(model_sd))):
+        raise RuntimeError(f"Checkpoint mismatch: matched {matched}/{len(model_sd)} keys.")
 
-    model.to(device).eval()
-    return model
+    incompat = model.load_state_dict(state, strict=False)
+    if incompat.missing_keys:
+        print(f"[WARN] Missing keys: {len(incompat.missing_keys)}")
+    if incompat.unexpected_keys:
+        print(f"[WARN] Unexpected keys: {len(incompat.unexpected_keys)}")
+
+    return model.to(device).eval()
 
 
-def main():
-    device = get_device()
-    ckpt_path = pick_best_checkpoint(CHECKPOINT_DIR, MODEL_KEYWORD)
-    print(f"[INFO] Device: {device}")
-    print(f"[INFO] Using checkpoint: {ckpt_path.name}")
-
-    model = build_model_from_checkpoint(ckpt_path, device)
-
-    x_test = load_npz_images(TEST_NPZ)
-    if x_test.max() > 1.0:
-        x_test = x_test / 255.0
-
-    mean, std = compute_mean_std(TRAIN_NPZ)
-    x_test = (x_test - mean) / (std + 1e-8)
-
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(x_test.astype(np.float32))),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-    )
+def predict(model: nn.Module, x_test: np.ndarray, device: torch.device) -> np.ndarray:
+    ds = TensorDataset(torch.from_numpy(x_test.astype(np.float32)))
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     preds = []
     with torch.inference_mode():
-        for (xb,) in loader:
+        for (xb,) in dl:
             logits = model(xb.to(device))
             preds.append(torch.argmax(logits, dim=1).cpu().numpy())
-    preds = np.concatenate(preds).astype(np.int64)
 
-    class_names = load_class_names(TRAIN_NPZ)
-    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-        for p in preds.tolist():
-            if WRITE_CLASS_NAMES and class_names and 0 <= p < len(class_names):
-                f.write(class_names[p] + "\n")
-            else:
-                f.write(f"{p}\n")
+    return np.concatenate(preds).astype(np.int64)
+
+
+def main() -> None:
+    device = choose_device()
+    ckpt = pick_best_light_checkpoint(CHECKPOINT_DIR)
+
+    print(f"[INFO] Device: {device}")
+    print(f"[INFO] Checkpoint: {ckpt.name}")
+
+    model = build_model_from_checkpoint(ckpt, device)
+
+    x_test = load_flat_images(TEST_NPZ)
+    if x_test.max() > 1.0:
+        x_test = x_test / 255.0
+
+    mean, std = compute_train_stats(TRAIN_NPZ)
+    x_test = (x_test - mean) / (std + 1e-8)
+
+    preds = predict(model, x_test, device)
+    np.savetxt(OUTPUT_TXT, preds, fmt="%d")
 
     print(f"[OK] Predictions: {len(preds)}")
-    print(f"[OK] Saved: {OUTPUT_FILE}")
+    print(f"[OK] Output: {OUTPUT_TXT}")
 
 
 if __name__ == "__main__":
